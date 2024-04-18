@@ -48,24 +48,35 @@ ModbusRTUSlave::ModbusRTUSlave(Serial_& serial, uint8_t dePin) {
 }
 #endif
 
-void ModbusRTUSlave::configureCoils(bool coils[], uint16_t numCoils) {
+void ModbusRTUSlave::configureCoils(register_block_t specs[], uint8_t spec_count, bool coils[]) {
   _coils = coils;
-  _numCoils = numCoils;
+  _coil_specs = specs;
+  _coil_spec_count = spec_count;
 }
 
-void ModbusRTUSlave::configureDiscreteInputs(bool discreteInputs[], uint16_t numDiscreteInputs) {
+void ModbusRTUSlave::configureDiscreteInputs(register_block_t specs[], uint8_t spec_count, uint8_t discreteInputs[]) {
   _discreteInputs = discreteInputs;
-  _numDiscreteInputs = numDiscreteInputs;
+  _DI_specs = specs;
+  _coil_spec_count = spec_count;
 }
 
-void ModbusRTUSlave::configureHoldingRegisters(uint16_t holdingRegisters[], uint16_t numHoldingRegisters) {
+void ModbusRTUSlave::configureHoldingRegisters(register_block_t specs[], uint8_t spec_count, uint16_t holdingRegisters[]) {
   _holdingRegisters = holdingRegisters;
-  _numHoldingRegisters = numHoldingRegisters;
+  _HR_specs = specs;
+  _coil_spec_count = spec_count;
 }
 
-void ModbusRTUSlave::configureInputRegisters(uint16_t inputRegisters[], uint16_t numInputRegisters) {
+void ModbusRTUSlave::configureInputRegisters(register_block_t specs[], uint8_t spec_count, uint16_t inputRegisters[]) {
   _inputRegisters = inputRegisters;
-  _numInputRegisters = numInputRegisters;
+  _IR_specs = specs;
+  _coil_spec_count = spec_count;
+}
+
+void ModbusRTUSlave::registerByteHandlers(ByteHandler *handlers) {
+  _byteHandlers = handlers;
+}
+void ModbusRTUSlave::registerWordHandlers(WordHandler *handlers) {
+  _wordHandlers = handlers;
 }
 
 #ifdef ESP32
@@ -154,31 +165,80 @@ void ModbusRTUSlave::poll() {
   }
 }
 
+uint8_t ModbusRTUSlave::findSpec(int16_t reg, register_block_t *specs, uint8_t spec_count, int16_t &block_start, int16_t &offset, uint8_t &handler_index, int16_t &store_index) {
+  int16_t si = 0;
+  while(spec_count--) {
+    if(reg < specs->start)
+      return 2; // illegal data address
+    if(reg < (specs->start + specs->count)) {
+      block_start = specs->start;
+      offset = reg - specs->start;
+      handler_index = specs->handler_index;
+      store_index = si + offset;
+      return 0;
+    }
+    si += specs->count;
+    specs++;
+  }
+  return 2; //illegal data address
+}
+
+int16_t ModbusRTUSlave::reg_to_storeIndex(register_block_t* specs, uint8_t spec_count, int16_t reg) {
+  int16_t si = 0;
+  while(spec_count--) {
+    if(reg < specs->start)
+      return -1; // illegal data address
+    if(reg < (specs->start + specs->count)) {
+      return si + (reg - specs->start);
+    }
+    si += specs->count;
+    specs++;
+  }
+  return -1; //illegal data address
+
+};
+
+
 void ModbusRTUSlave::_processReadCoils() {
   uint16_t startAddress = _bytesToWord(_buf[2], _buf[3]);
   uint16_t quantity = _bytesToWord(_buf[4], _buf[5]);
-  if (!_coils || _numCoils == 0) _exceptionResponse(1);
+  if (!_coils /*|| _numCoils == 0*/) _exceptionResponse(1);
   else if (quantity == 0 || quantity > 2000) _exceptionResponse(3);
-  else if (quantity > _numCoils || startAddress > (_numCoils - quantity)) _exceptionResponse(2);
+ //else if (quantity > _numCoils || startAddress > (_numCoils - quantity)) _exceptionResponse(2);
   else {
-    _buf[2] = _div8RndUp(quantity);
+    _buf[2] = _div8RndUp(quantity);   // prepare response.qty 
     for (uint16_t i = 0; i < quantity; i++) {
-      bitWrite(_buf[3 + (i >> 3)], i & 7, _coils[startAddress + i]);
+      int16_t blockstart, blockoffset, store_index;
+      uint8_t handler_index;
+      uint8_t rc = findSpec(startAddress + i, _coil_specs, _coil_spec_count, blockstart, blockoffset, handler_index, store_index);
+      if(rc != 0)
+        _exceptionResponse(rc);
+      else {
+        bitWrite(_buf[3 + (i >> 3)], i & 7, _coils[store_index]);   // writes from _coils[] to buffer
+        (_byteHandlers[handler_index])(blockstart, blockoffset, store_index);
+      }
     }
-    _writeResponse(3 + _buf[2]);
+    _writeResponse(3 + _buf[2]); //response is 3 + #of coils
   }
 }
 
 void ModbusRTUSlave::_processReadDiscreteInputs() {
   uint16_t startAddress = _bytesToWord(_buf[2], _buf[3]);
   uint16_t quantity = _bytesToWord(_buf[4], _buf[5]);
-  if (!_discreteInputs || _numDiscreteInputs == 0) _exceptionResponse(1);
+  if (!_discreteInputs) _exceptionResponse(1);
   else if (quantity == 0 || quantity > 2000) _exceptionResponse(3);
-  else if (quantity > _numDiscreteInputs || startAddress > (_numDiscreteInputs - quantity)) _exceptionResponse(2);
   else {
     _buf[2] = _div8RndUp(quantity);
     for (uint16_t i = 0; i < quantity; i++) {
-      bitWrite(_buf[3 + (i >> 3)], i & 7, _discreteInputs[startAddress + i]);
+      int16_t blockstart, blockoffset, store_index;
+      uint8_t handler_index;
+      uint8_t rc = findSpec(startAddress + i, _DI_specs, _DI_spec_count, blockstart, blockoffset, handler_index, store_index);
+      if(rc != 0)
+        _exceptionResponse(rc);
+      else {
+        bitWrite(_buf[3 + (i >> 3)], i & 7, _discreteInputs[startAddress + i]);
+        (_byteHandlers[handler_index])(blockstart, blockoffset, store_index);
+      }
     }
     _writeResponse(3 + _buf[2]);
   }
@@ -187,14 +247,23 @@ void ModbusRTUSlave::_processReadDiscreteInputs() {
 void ModbusRTUSlave::_processReadHoldingRegisters() {
   uint16_t startAddress = _bytesToWord(_buf[2], _buf[3]);
   uint16_t quantity = _bytesToWord(_buf[4], _buf[5]);
-  if (!_holdingRegisters || _numHoldingRegisters == 0) _exceptionResponse(1);
+  if (!_holdingRegisters /*|| _numHoldingRegisters == 0*/) _exceptionResponse(1);
   else if (quantity == 0 || quantity > 125) _exceptionResponse(3);
-  else if (quantity > _numHoldingRegisters || startAddress > (_numHoldingRegisters - quantity)) _exceptionResponse(2);
+  //else if (quantity > _numHoldingRegisters || startAddress > (_numHoldingRegisters - quantity)) _exceptionResponse(2);
   else {
     _buf[2] = quantity * 2;
     for (uint16_t i = 0; i < quantity; i++) {
-      _buf[3 + (i * 2)] = highByte(_holdingRegisters[startAddress + i]);
-      _buf[4 + (i * 2)] = lowByte(_holdingRegisters[startAddress + i]);
+      int16_t blockstart, blockoffset, store_index;
+      uint8_t handler_index;
+      uint8_t rc = findSpec(startAddress + i, _HR_specs, _HR_spec_count, blockstart, blockoffset, handler_index, store_index);
+      if(rc != 0)
+        _exceptionResponse(rc);
+      else {
+          int16_t val = _holdingRegisters[store_index];
+          _buf[3 + (i * 2)] = highByte(val);
+          _buf[4 + (i * 2)] = lowByte(val);
+          (_wordHandlers[handler_index])(blockstart, blockoffset, store_index);
+      }
     }
     _writeResponse(3 + _buf[2]);
   }
@@ -203,25 +272,36 @@ void ModbusRTUSlave::_processReadHoldingRegisters() {
 void ModbusRTUSlave::_processReadInputRegisters() {
   uint16_t startAddress = _bytesToWord(_buf[2], _buf[3]);
   uint16_t quantity = _bytesToWord(_buf[4], _buf[5]);
-  if (!_inputRegisters || _numInputRegisters == 0) _exceptionResponse(1);
-  else if (quantity == 0 || quantity > 125) _exceptionResponse(3);
-  else if (quantity > _numInputRegisters || startAddress > (_numInputRegisters - quantity)) _exceptionResponse(2);
+  if (!_inputRegisters /*|| _numInputRegisters == 0*/) _exceptionResponse(1);
+  else if (quantity == 0 /*|| quantity > 125*/) _exceptionResponse(3);
+  //else if (quantity > _numInputRegisters || startAddress > (_numInputRegisters - quantity)) _exceptionResponse(2);
   else {
     _buf[2] = quantity * 2;
+
     for (uint16_t i = 0; i < quantity; i++) {
-      _buf[3 + (i * 2)] = highByte(_inputRegisters[startAddress + i]);
-      _buf[4 + (i * 2)] = lowByte(_inputRegisters[startAddress + i]);
+      int16_t blockstart, blockoffset, store_index;
+      uint8_t handler_index;
+      uint8_t rc = findSpec(startAddress + i, _IR_specs, _IR_spec_count, blockstart, blockoffset, handler_index, store_index);
+      if(rc != 0)
+          _exceptionResponse(rc);
+      else {
+          int16_t val = _inputRegisters[store_index];
+          _buf[3 + (i * 2)] = highByte(val);
+          _buf[4 + (i * 2)] = lowByte(val);
+          (_wordHandlers[handler_index])(blockstart, blockoffset, store_index);
+      }
     }
     _writeResponse(3 + _buf[2]);
   }
 }
 
+//TODO following processors
 void ModbusRTUSlave::_processWriteSingleCoil() {
   uint16_t address = _bytesToWord(_buf[2], _buf[3]);
   uint16_t value = _bytesToWord(_buf[4], _buf[5]);
-  if (!_coils ||_numCoils == 0) _exceptionResponse(1);
+  if (!_coils /*||_numCoils == 0*/) _exceptionResponse(1);
   else if (value != 0 && value != 0xFF00) _exceptionResponse(3);
-  else if (address >= _numCoils) _exceptionResponse(2);
+  //else if (address >= _numCoils) _exceptionResponse(2);
   else {
     _coils[address] = value;
     _writeResponse(6);
@@ -231,8 +311,8 @@ void ModbusRTUSlave::_processWriteSingleCoil() {
 void ModbusRTUSlave::_processWriteSingleHoldingRegister() {
   uint16_t address = _bytesToWord(_buf[2], _buf[3]);
   uint16_t value = _bytesToWord(_buf[4], _buf[5]);
-  if (!_holdingRegisters || _numHoldingRegisters == 0) _exceptionResponse(1);
-  else if (address >= _numHoldingRegisters) _exceptionResponse(2);
+  if (!_holdingRegisters /*|| _numHoldingRegisters == 0*/) _exceptionResponse(1);
+  //else if (address >= _numHoldingRegisters) _exceptionResponse(2);
   else {
     _holdingRegisters[address] = value;
     _writeResponse(6);
@@ -242,9 +322,9 @@ void ModbusRTUSlave::_processWriteSingleHoldingRegister() {
 void ModbusRTUSlave::_processWriteMultipleCoils() {
   uint16_t startAddress = _bytesToWord(_buf[2], _buf[3]);
   uint16_t quantity = _bytesToWord(_buf[4], _buf[5]);
-  if (!_coils || _numCoils == 0) _exceptionResponse(1);
+  if (!_coils /*|| _numCoils == 0*/) _exceptionResponse(1);
   else if (quantity == 0 || quantity > 1968 || _buf[6] != _div8RndUp(quantity)) _exceptionResponse(3);
-  else if (quantity > _numCoils || startAddress > (_numCoils - quantity)) _exceptionResponse(2);
+  //else if (quantity > _numCoils || startAddress > (_numCoils - quantity)) _exceptionResponse(2);
   else {
     for (uint16_t i = 0; i < quantity; i++) {
       _coils[startAddress + i] = bitRead(_buf[7 + (i >> 3)], i & 7);
@@ -256,9 +336,9 @@ void ModbusRTUSlave::_processWriteMultipleCoils() {
 void ModbusRTUSlave::_processWriteMultipleHoldingRegisters() {
   uint16_t startAddress = _bytesToWord(_buf[2], _buf[3]);
   uint16_t quantity = _bytesToWord(_buf[4], _buf[5]);
-  if (!_holdingRegisters || _numHoldingRegisters == 0) _exceptionResponse(1);
+  if (!_holdingRegisters /*|| _numHoldingRegisters == 0*/) _exceptionResponse(1);
   else if (quantity == 0 || quantity > 123 || _buf[6] != (quantity * 2)) _exceptionResponse(3);
-  else if (quantity > _numHoldingRegisters || startAddress > (_numHoldingRegisters - quantity)) _exceptionResponse(2);
+  //else if (quantity > _numHoldingRegisters || startAddress > (_numHoldingRegisters - quantity)) _exceptionResponse(2);
   else {
     for (uint16_t i = 0; i < quantity; i++) {
       _holdingRegisters[startAddress + i] = _bytesToWord(_buf[i * 2 + 7], _buf[i * 2 + 8]);
